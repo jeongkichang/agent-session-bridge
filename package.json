@@ -1,0 +1,18 @@
+{
+  "name": "agent-session-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local request and reply bridge for Claude Code Channels and Codex MCP",
+  "engines": { "node": ">=24.0.0" },
+  "packageManager": "pnpm@10.4.1",
+  "bin": { "agent-session-bridge": "dist/cli.js" },
+  "scripts": {
+    "build": "tsc",
+    "test": "pnpm build && node --test --test-concurrency=1 dist/test/*.test.js",
+    "check": "tsc --noEmit",
+    "start": "node dist/cli.js start"
+  },
+  "dependencies": { "@modelcontextprotocol/sdk": "1.30.0", "zod": "3.25.76" },
+  "devDependencies": { "@types/node": "^24.0.0", "typescript": "~5.9.3" }
+}
