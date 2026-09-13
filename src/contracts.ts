@@ -1,6 +1,8 @@
 import { z } from 'zod';
 
 export const MAX_TEXT_BYTES = 32 * 1024;
+// One decoded byte can use six JSON bytes (for example a control character).
+export const MAX_JSON_BYTES = MAX_TEXT_BYTES * 6 + 4096;
 export const PEER_LEASE_MS = 45_000;
 export const textSchema = z.string().min(1).refine((s) => Buffer.byteLength(s) <= MAX_TEXT_BYTES, 'Text exceeds 32 KiB');
 export const nameSchema = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/);
