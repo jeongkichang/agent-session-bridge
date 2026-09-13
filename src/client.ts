@@ -40,6 +40,9 @@ export class BridgeClient {
     try { await this.request('/v1/peer', { method: 'DELETE', timeout: 1500 }); } catch { /* expiry marks offline */ }
   }
   async peers(): Promise<Peer[]> { return (await this.request<{ peers: Peer[] }>('/v1/peers')).peers; }
+  summaries(direction: 'sent' | 'received' | 'both' = 'both', limit = 20) {
+    return this.request('/v1/my-requests?direction=' + direction + '&limit=' + limit);
+  }
   send(input: { request_id: string; peer_id: string; text: string; ttl_seconds?: number }) {
     return this.request<BridgeRequest>('/v1/requests', { method: 'POST', body: input });
   }

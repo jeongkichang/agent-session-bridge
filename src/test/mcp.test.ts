@@ -19,7 +19,7 @@ function data(result: Awaited<ReturnType<Client['callTool']>>): any {
 
 test('real stdio MCP adapters: channel delivery, explicit reply, reverse request and Codex inbox', { timeout: 20_000 }, async () => {
   const directory = mkdtempSync(join(tmpdir(), 'agent-bridge-mcp-'));
-  const broker = await startBroker({ directory });
+  let broker = await startBroker({ directory });
   const env = { ...Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined)), AGENT_BRIDGE_STATE_DIR: directory };
   const codex = new Client({ name: 'codex-test-host', version: '1' });
   const claude = new Client({ name: 'claude-test-host', version: '1' });
@@ -60,6 +60,46 @@ test('real stdio MCP adapters: channel delivery, explicit reply, reverse request
     data(await codex.callTool({ name: 'reply', arguments: { request_id: reverseId, text: 'answer from Codex' } }));
     const reverse = data(await claude.callTool({ name: 'get_reply', arguments: { request_id: reverseId } }));
     assert.equal(reverse.reply, 'answer from Codex');
+    const repeatedWait = data(await claude.callTool({ name: 'wait_reply', arguments: { request_id: reverseId, timeout_ms: 0 } }));
+    assert.equal(repeatedWait.timed_out, false);
+    assert.equal(repeatedWait.request.state, 'completed');
+    const inventory = data(await claude.callTool({ name: 'list_requests', arguments: { direction: 'sent' } }));
+    assert.equal(inventory.requests.length, 1);
+    assert.equal(inventory.requests[0].request_id, reverseId);
+    assert.equal(inventory.requests[0].has_reply, true);
+    assert.equal('reply' in inventory.requests[0], false);
+    assert.equal('text' in inventory.requests[0], false);
+    const missing = await claude.callTool({ name: 'get_reply', arguments: { request_id: randomUUID() } });
+    assert.equal(missing.isError, true);
+    const missingBody = JSON.parse((missing.content as { text: string }[])[0]!.text);
+    assert.equal(missingBody.error, 'request_not_found');
+    assert.match(missingBody.retry, /owner CLI/);
+    assert.equal(peerData.self.version, '0.2.0');
+    assert.equal(peerData.broker.version, '0.2.0');
+    // Restart only the broker; keep the real MCP processes and their identities.
+    const originalInstance = peerData.broker.instance;
+    const interruptedId = randomUUID();
+    data(await codex.callTool({ name: 'send_message', arguments: { request_id: interruptedId, peer_id: claudePeer.id, text: 'do not replay after broker restart' } }));
+    for (let i = 0; i < 100 && !notifications.some((n) => n.meta.request_id === interruptedId); i++) await delay(25);
+    assert.ok(notifications.some((n) => n.meta.request_id === interruptedId));
+    await broker.stop(); broker = await startBroker({ directory });
+    for (let i = 0; i < 240; i++) {
+      peerData = data(await codex.callTool({ name: 'list_peers', arguments: {} }));
+      if (peerData.peers.some((p: any) => p.id === peerData.self.id && p.online) && peerData.peers.some((p: any) => p.id === claudePeer.id && p.online)) break;
+      await delay(50);
+    }
+    assert.notEqual(peerData.broker.instance, originalInstance);
+    assert.equal(peerData.peers.find((p: any) => p.id === peerData.self.id)?.online, true);
+    assert.equal(peerData.peers.find((p: any) => p.id === claudePeer.id)?.online, true);
+    assert.equal(data(await codex.callTool({ name: 'get_reply', arguments: { request_id: interruptedId } })).state, 'delivery_unknown');
+    assert.equal(data(await codex.callTool({ name: 'get_reply', arguments: { request_id: requestId } })).reply, 'stdio-response-17');
+    const afterRestartId = randomUUID();
+    data(await codex.callTool({ name: 'send_message', arguments: { request_id: afterRestartId, peer_id: claudePeer.id, text: 'new request after broker restart' } }));
+    for (let i = 0; i < 100 && !notifications.some((n) => n.meta.request_id === afterRestartId); i++) await delay(25);
+    assert.ok(notifications.some((n) => n.meta.request_id === afterRestartId));
+    assert.equal(notifications.filter((n) => n.meta.request_id === interruptedId).length, 1);
+    data(await claude.callTool({ name: 'reply', arguments: { request_id: afterRestartId, text: 'recovered' } }));
+    assert.equal(data(await codex.callTool({ name: 'get_reply', arguments: { request_id: afterRestartId } })).reply, 'recovered');
   } finally {
     await codex.close(); await claude.close();
     await broker.stop(); rmSync(directory, { recursive: true });

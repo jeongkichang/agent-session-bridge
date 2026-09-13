@@ -41,6 +41,7 @@ export class Store {
     this.db.prepare("UPDATE requests SET state='delivery_unknown', reason='reply_deadline_elapsed', finished_at=? WHERE state IN ('delivered','acknowledged') AND expires_at<=?").run(now, now);
   }
   register(input: z.infer<typeof registrationSchema>): Peer {
+    this.sweep();
     const now = this.now();
     const old = this.db.prepare('SELECT * FROM peers WHERE id=?').get(input.id) as Row | undefined;
     if (old && (old.secret_hash !== hash(input.secret) || old.name !== input.name || old.kind !== input.kind)) throw new BridgeError('peer_conflict', 409);
@@ -55,6 +56,8 @@ export class Store {
     return row ? String(row.id) : null;
   }
   heartbeat(id: string) {
+    // Preserve a lost lease before extending it, even between periodic sweeps.
+    this.sweep();
     const peer = this.peer(id);
     const successor = this.db.prepare('SELECT id FROM peers WHERE name=? AND id<>? AND lease_until>?').get(peer.name, id, this.now());
     if (successor) throw new BridgeError('peer_superseded', 409);
@@ -92,6 +95,11 @@ export class Store {
     if (old) {
       if (old.fingerprint !== fingerprint) throw new BridgeError('request_id_conflict', 409);
       return this.request(input.request_id, from);
+    }
+    const sender = this.peer(from);
+    if (!sender.online) {
+      const successor = this.db.prepare('SELECT id FROM peers WHERE name=? AND id<>? AND lease_until>?').get(sender.name, from, this.now());
+      throw new BridgeError(successor ? 'peer_superseded' : 'peer_offline', 409);
     }
     if (from === input.peer_id) throw new BridgeError('self_message', 400);
     if (!this.peer(input.peer_id).online) throw new BridgeError('peer_offline', 409);
@@ -133,5 +141,18 @@ export class Store {
   }
   recent(): BridgeRequest[] {
     return (this.db.prepare('SELECT id FROM requests ORDER BY created_at DESC LIMIT 100').all() as Row[]).map((r) => this.request(String(r.id)));
+  }
+  summaries(viewer: string, direction: 'sent' | 'received' | 'both', limit: number) {
+    this.sweep();
+    const where = direction === 'sent' ? 'from_id=?' : direction === 'received' ? 'to_id=?' : '(from_id=? OR to_id=?)';
+    const bindings = direction === 'both' ? [viewer, viewer] : [viewer];
+    const rows = this.db.prepare(`SELECT id FROM requests WHERE ${where} ORDER BY COALESCE(finished_at,acknowledged_at,delivered_at,created_at) DESC,id DESC LIMIT ?`).all(...bindings, limit + 1) as Row[];
+    return {
+      requests: rows.slice(0, limit).map((row) => {
+        const { text: _text, reply, ...request } = this.request(String(row.id), viewer);
+        return { ...request, has_reply: reply !== null };
+      }),
+      has_more: rows.length > limit,
+    };
   }
 }

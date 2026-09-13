@@ -5,8 +5,9 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
 import { DatabaseSync } from 'node:sqlite';
-import { BridgeError, idSchema, registrationSchema, replySchema, sendSchema, terminalStates } from './contracts.js';
+import { BridgeError, idSchema, registrationSchema, replySchema, sendSchema, terminalStates, MAX_JSON_BYTES } from './contracts.js';
 import { Store } from './store.js';
+import { VERSION } from './version.js';
 import { ownerToken, privateDirectory, privateFile, stateDirectory } from './state.js';
 
 async function body(request: IncomingMessage): Promise<unknown> {
@@ -14,7 +15,7 @@ async function body(request: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = []; let bytes = 0;
   for await (const chunk of request) {
     bytes += chunk.length;
-    if (bytes > 48 * 1024) throw new BridgeError('body_too_large', 413);
+    if (bytes > MAX_JSON_BYTES) throw new BridgeError('body_too_large', 413);
     chunks.push(chunk);
   }
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); }
@@ -58,7 +59,7 @@ export async function startBroker(options: { directory: string; port?: number; e
       const path = url.pathname;
       const method = request.method;
       const peerOnly = () => { if (!actor) throw new BridgeError('peer_identity_required', 403); return actor; };
-      if (method === 'GET' && path === '/health') { json(response, 200, { ok: true, instance, pid: process.pid, version: '0.1.0' }); return; }
+      if (method === 'GET' && path === '/health') { json(response, 200, { ok: true, instance, pid: process.pid, version: VERSION }); return; }
       if (method === 'POST' && path === '/v1/register') {
         if (!owner) throw new BridgeError('owner_required', 403);
         json(response, 200, store.register(registrationSchema.parse(await body(request)))); return;
@@ -70,6 +71,11 @@ export async function startBroker(options: { directory: string; port?: number; e
       if (method === 'GET' && path === '/v1/requests') {
         if (!owner) throw new BridgeError('owner_required', 403);
         json(response, 200, { requests: store.recent() }); return;
+      }
+      if (method === 'GET' && path === '/v1/my-requests') {
+        const direction = z.enum(['sent', 'received', 'both']).parse(url.searchParams.get('direction') || 'both');
+        const limit = z.coerce.number().int().min(1).max(100).parse(url.searchParams.get('limit') || '20');
+        json(response, 200, store.summaries(peerOnly(), direction, limit)); return;
       }
       if (method === 'POST' && path === '/v1/inbox/next') {
         const peer = peerOnly();

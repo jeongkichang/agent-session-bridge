@@ -9,6 +9,7 @@ import { BridgeClient } from './client.js';
 import { runBroker } from './broker.js';
 import { ownerToken, privateDirectory, privateFile, readEndpoint, stateDirectory } from './state.js';
 import { BridgeError, nameSchema, idSchema, type BridgeRequest } from './contracts.js';
+import { VERSION } from './version.js';
 
 const directory = stateDirectory();
 const here = dirname(fileURLToPath(import.meta.url));
@@ -113,16 +114,16 @@ async function main() {
     await ensureStarted();
     // Additional config is process-local; no existing Claude settings or aliases are edited.
     const child = spawn(process.env.AGENT_BRIDGE_CLAUDE_COMMAND || 'claude', [
-      ...forwarded, '--mcp-config', JSON.stringify(config), '--dangerously-load-development-channels', 'server:session-bridge',
+      '--dangerously-load-development-channels', 'server:session-bridge', '--mcp-config', JSON.stringify(config), ...forwarded,
     ], { stdio: 'inherit', env: { ...process.env, MCP_PROTOCOL_NEGOTIATION: 'legacy' } });
     child.once('error', () => { process.stderr.write('Cannot launch Claude Code\n'); process.exitCode = 1; });
-    child.once('exit', (code) => { process.exitCode = code || 0; });
+    child.once('exit', (code, signal) => { process.exitCode = code ?? (signal ? 1 : 0); });
     return;
   }
   if (command === 'doctor') {
     let broker: unknown;
     try { broker = await ownerRequest('/health'); } catch { broker = { ok: false, reason: 'broker_not_running' }; }
-    output({ node: process.version, state_directory: directory, broker, automatic_desktop_wakeup: 'not_configured', desktop_reply_path: 'MCP get_reply / wait_reply / receive_message', endpoint_file_present: existsSync(join(directory, 'endpoint.json')) });
+    output({ version: VERSION, node: process.version, state_directory: directory, broker, automatic_desktop_wakeup: 'not_configured', desktop_reply_path: 'MCP list_requests / get_reply / wait_reply / receive_message', endpoint_file_present: existsSync(join(directory, 'endpoint.json')) });
     return;
   }
   process.stdout.write(`Agent Session Bridge\n\nstart | stop | status | doctor | peers | history\nget <request-id> | wait <request-id>\nsend <peer-id-or-name> --file <message.txt> [--id <uuid>]\ncodex-mcp [--name <peer-name>]\nclaude-channel [--name <peer-name>]\nclaude-config [--name <peer-name>]\nclaude --name <peer-name> -- [Claude arguments, e.g. --resume <id>]\n\nClaude's development-channel confirmation and session permissions still apply.\nOnly explicitly connected sessions appear in peers.\n`);

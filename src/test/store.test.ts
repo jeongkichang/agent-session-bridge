@@ -89,6 +89,60 @@ test('request waiting to be sent expires without pretending execution failed', (
   assert.equal(store.request(request.request_id, sender.id).state, 'expired'); store.close();
 });
 
+test('superseded senders cannot dispatch new work but can inspect and retry their original request', () => {
+  const { store, sender, receiver, register, send, advance } = setup();
+  try {
+    const original = send();
+    advance(PEER_LEASE_MS + 1);
+    const replacement = register('sender');
+    store.heartbeat(receiver.id);
+    assert.throws(() => send('new work'), code('peer_superseded'));
+    assert.equal(send(original.text, original.request_id).request_id, original.request_id);
+    assert.equal(store.request(original.request_id, sender.id).text, original.text);
+    assert.equal(store.send(replacement.id, { request_id: randomUUID(), peer_id: receiver.id, text: 'new sender', ttl_seconds: 60 }).state, 'queued');
+    store.disconnect(replacement.id);
+    assert.throws(() => store.send(replacement.id, { request_id: randomUUID(), peer_id: receiver.id, text: 'offline', ttl_seconds: 60 }), code('peer_offline'));
+  } finally { store.close(); }
+});
+
+test('lease renewal cannot erase a disconnect between periodic sweeps', () => {
+  for (const renew of ['heartbeat', 'register'] as const) {
+    for (const acknowledged of [false, true]) {
+      const { store, sender, receiver, send, advance } = setup();
+      try {
+        const request = send(); store.take(receiver.id);
+        if (acknowledged) store.acknowledge(request.request_id, receiver.id);
+        advance(PEER_LEASE_MS + 1);
+        if (renew === 'heartbeat') store.heartbeat(receiver.id);
+        else store.register(receiver);
+        const result = store.request(request.request_id, sender.id);
+        assert.equal(result.state, 'delivery_unknown');
+        assert.equal(result.reason, 'recipient_disconnected');
+        assert.equal(store.peer(receiver.id).online, true);
+        assert.equal(store.take(receiver.id), null);
+      } finally { store.close(); }
+    }
+  }
+});
+
+test('request inventory is private, bounded, and includes replies without returning message bodies', () => {
+  const { store, sender, receiver, register, send, advance } = setup();
+  try {
+    const stranger = register('stranger');
+    const first = send('private body'); store.take(receiver.id);
+    store.reply(receiver.id, { request_id: first.request_id, text: 'private answer', outcome: 'completed' });
+    advance(1); const second = send('second');
+    const result = store.summaries(sender.id, 'sent', 1);
+    assert.equal(result.has_more, true);
+    assert.equal(result.requests[0]?.request_id, second.request_id);
+    const completed = store.summaries(receiver.id, 'received', 20).requests.find((r) => r.request_id === first.request_id)!;
+    assert.equal(completed.state, 'completed'); assert.equal(completed.has_reply, true);
+    assert.equal('text' in completed, false); assert.equal('reply' in completed, false);
+    assert.equal(store.summaries(stranger.id, 'both', 100).requests.length, 0);
+    assert.equal(store.summaries(sender.id, 'received', 100).requests.length, 0);
+  } finally { store.close(); }
+});
+
 test('restart preserves completed and queued records; dispatched work is uncertain', () => {
   const dir = mkdtempSync(join(tmpdir(), 'agent-bridge-store-'));
   const path = join(dir, 'state.sqlite');

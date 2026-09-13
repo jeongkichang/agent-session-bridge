@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { request as httpRequest } from 'node:http';
 import { startBroker } from '../broker.js';
 import { BridgeClient } from '../client.js';
+import { MAX_TEXT_BYTES } from '../contracts.js';
 
 async function setup() {
   const directory = mkdtempSync(join(tmpdir(), 'agent-bridge-http-'));
@@ -51,6 +52,35 @@ test('HTTP rejects missing/wrong auth, browser origin, hostile Host, and oversiz
     });
     assert.equal(badHost, 403);
     await assert.rejects(fixture.sender.send({ request_id: randomUUID(), peer_id: fixture.receiver.id, text: '한'.repeat(12000) }), /invalid_input/);
-    await assert.rejects(fixture.sender.send({ request_id: randomUUID(), peer_id: fixture.receiver.id, text: 'x'.repeat(60000) }), /body_too_large/);
+    await assert.rejects(fixture.sender.send({ request_id: randomUUID(), peer_id: fixture.receiver.id, text: '\u0001'.repeat(60000) }), /body_too_large/);
   } finally { await fixture.close(); }
+});
+
+test('HTTP accepts JSON-escaped text at the decoded byte limit for both send and reply', async () => {
+  const fixture = await setup();
+  try {
+    for (const character of ['\\', '"', String.fromCharCode(1)]) {
+      const text = character.repeat(MAX_TEXT_BYTES);
+      const id = randomUUID();
+      await fixture.sender.send({ request_id: id, peer_id: fixture.receiver.id, text });
+      assert.equal((await fixture.receiver.receive(0)).message?.text, text);
+      await fixture.receiver.reply(id, text);
+      assert.equal((await fixture.sender.get(id)).reply, text);
+    }
+    await assert.rejects(fixture.sender.send({ request_id: randomUUID(), peer_id: fixture.receiver.id, text: 'x'.repeat(MAX_TEXT_BYTES + 1) }), /invalid_input/);
+  } finally { await fixture.close(); }
+});
+
+test('HTTP inventory restricts results to the authenticated connection and validates bounds', async () => {
+  const fixture = await setup();
+  const stranger = new BridgeClient('stranger', 'codex', fixture.sender.directory, fixture.endpoint.url);
+  try {
+    await stranger.connect();
+    const sent = await fixture.sender.send({ request_id: randomUUID(), peer_id: fixture.receiver.id, text: 'must not appear in inventory' });
+    const own = await fixture.sender.summaries('sent', 20) as { requests: { request_id: string }[] };
+    assert.equal(own.requests[0]?.request_id, sent.request_id);
+    assert.equal(JSON.stringify(own).includes('must not appear'), false);
+    assert.deepEqual(await stranger.summaries(), { requests: [], has_more: false });
+    await assert.rejects(fixture.sender.summaries('both', 101), /invalid_input/);
+  } finally { await stranger.close(); await fixture.close(); }
 });
