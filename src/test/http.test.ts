@@ -18,6 +18,32 @@ async function setup() {
   return { ...broker, sender, receiver, close: async () => { await sender.close(); await receiver.close(); await broker.stop(); rmSync(directory, { recursive: true }); } };
 }
 
+test('waiting requests are woken by arrival, not by the recheck interval', async () => {
+  const fixture = await setup();
+  const { sender, receiver } = fixture;
+  try {
+    // 재확인 주기는 2초다. 신호가 끊기면 아래 시간이 2초 가까이로 늘어난다.
+    const waitingForMessage = receiver.receive(5000);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const input = { request_id: randomUUID(), peer_id: receiver.id, text: 'wake me' };
+    const sentAt = Date.now();
+    await sender.send(input);
+    const { message } = await waitingForMessage;
+    const deliveryMs = Date.now() - sentAt;
+    assert.equal(message?.request_id, input.request_id);
+    assert.ok(deliveryMs < 500, `arrival should wake the waiter immediately, took ${deliveryMs}ms`);
+
+    const waitingForReply = sender.wait(input.request_id, 5000);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const repliedAt = Date.now();
+    await receiver.reply(input.request_id, 'done');
+    const result = await waitingForReply;
+    const replyMs = Date.now() - repliedAt;
+    assert.equal(result.request.state, 'completed');
+    assert.ok(replyMs < 500, `reply should wake the waiter immediately, took ${replyMs}ms`);
+  } finally { await fixture.close(); }
+});
+
 test('HTTP long polling, timeout, concurrent retries, recipient reply and sender wait', async () => {
   const fixture = await setup();
   const { sender, receiver } = fixture;

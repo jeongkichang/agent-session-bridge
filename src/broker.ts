@@ -1,8 +1,8 @@
+import { EventEmitter } from 'node:events';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
 import { DatabaseSync } from 'node:sqlite';
 import { BridgeError, idSchema, registrationSchema, replySchema, sendSchema, terminalStates, MAX_JSON_BYTES } from './contracts.js';
@@ -37,6 +37,28 @@ export async function startBroker(options: { directory: string; port?: number; e
   privateFile(dbPath);
   let closing = false;
   const waiters = new Set<AbortController>();
+  /**
+   * 대기 중인 요청을 깨우는 신호. 브로커는 한 프로세스이므로 보내는 쪽과 기다리는 쪽이 같은 메모리에 있다.
+   * 이 신호는 «빠르게 하기» 위한 것이고, 놓쳐도 아래 재확인 주기가 받아 준다.
+   */
+  const wakeups = new EventEmitter();
+  wakeups.setMaxListeners(0);
+  const wake = (key: string) => wakeups.emit(key);
+  // 신호를 놓쳤을 때만 도는 재확인 주기. 짧게 두면 대기 수 × 쌓인 행 수만큼 CPU 를 태운다.
+  const RECHECK_MS = 2000;
+  const HEARTBEAT_MS = 10_000;
+  const sleepOrWake = (key: string, ms: number, signal: AbortSignal) =>
+    new Promise<void>((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        wakeups.off(key, done);
+        signal.removeEventListener('abort', done);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
+      wakeups.once(key, done);
+      signal.addEventListener('abort', done, { once: true });
+    });
   const sweep = setInterval(() => store.sweep(), 1000).unref();
   // 정리는 드물게 돈다. 1초짜리 sweep 에 얹으면 매초 DELETE 를 시도하게 된다.
   const retentionDays = Number(process.env.AGENT_BRIDGE_RETENTION_DAYS ?? 30);
@@ -71,7 +93,11 @@ export async function startBroker(options: { directory: string; port?: number; e
       if (method === 'POST' && path === '/v1/heartbeat') { store.heartbeat(peerOnly()); json(response, 200, { ok: true }); return; }
       if (method === 'DELETE' && path === '/v1/peer') { store.disconnect(peerOnly()); json(response, 200, { ok: true }); return; }
       if (method === 'GET' && path === '/v1/peers') { store.sweep(); json(response, 200, { peers: store.peers() }); return; }
-      if (method === 'POST' && path === '/v1/requests') { json(response, 202, store.send(peerOnly(), sendSchema.parse(await body(request)))); return; }
+      if (method === 'POST' && path === '/v1/requests') {
+        const accepted = store.send(peerOnly(), sendSchema.parse(await body(request)));
+        wake(`peer:${accepted.to.id}`);
+        json(response, 202, accepted); return;
+      }
       if (method === 'GET' && path === '/v1/requests') {
         if (!owner) throw new BridgeError('owner_required', 403);
         json(response, 200, { requests: store.recent() }); return;
@@ -85,11 +111,13 @@ export async function startBroker(options: { directory: string; port?: number; e
         const peer = peerOnly();
         const { timeout_ms } = z.object({ timeout_ms: z.number().int().min(0).max(50_000).default(0) }).strict().parse(await body(request));
         const deadline = Date.now() + timeout_ms;
+        let beat = 0;
         while (!abort.signal.aborted && !closing) {
-          store.heartbeat(peer);
+          // 임대 갱신은 10초에 한 번이면 충분하다(임대 45초). 회전마다 하면 대기 수만큼 쓰기가 늘어난다.
+          if (Date.now() - beat >= HEARTBEAT_MS) { store.heartbeat(peer); beat = Date.now(); }
           const message = store.take(peer);
           if (message || Date.now() >= deadline) { json(response, 200, { message, timed_out: !message }); return; }
-          await delay(150, undefined, { signal: abort.signal });
+          await sleepOrWake(`peer:${peer}`, Math.min(RECHECK_MS, Math.max(0, deadline - Date.now())), abort.signal);
         }
         return;
       }
@@ -98,12 +126,23 @@ export async function startBroker(options: { directory: string; port?: number; e
         const id = idSchema.parse(match[1]);
         const action = match[2];
         if (method === 'GET' && !action) { json(response, 200, store.request(id, actor || undefined)); return; }
-        if (method === 'POST' && action === 'ack') { json(response, 200, store.acknowledge(id, peerOnly())); return; }
+        if (method === 'POST' && action === 'ack') {
+          const acked = store.acknowledge(id, peerOnly());
+          wake(`request:${id}`);
+          json(response, 200, acked); return;
+        }
         if (method === 'POST' && action === 'reply') {
           const input = replySchema.omit({ request_id: true }).parse(await body(request));
-          json(response, 200, store.reply(peerOnly(), { ...input, request_id: id })); return;
+          const replied = store.reply(peerOnly(), { ...input, request_id: id });
+          wake(`request:${id}`);
+          json(response, 200, replied); return;
         }
-        if (method === 'POST' && action === 'delivery-failed') { json(response, 200, store.failDelivery(id, peerOnly())); return; }
+        if (method === 'POST' && action === 'delivery-failed') {
+          const failed = store.failDelivery(id, peerOnly());
+          wake(`request:${id}`);
+          wake(`peer:${failed.to.id}`);
+          json(response, 200, failed); return;
+        }
         if (method === 'GET' && action === 'wait') {
           const timeout = z.coerce.number().int().min(0).max(50_000).parse(url.searchParams.get('timeout_ms') || '0');
           const deadline = Date.now() + timeout;
@@ -112,7 +151,7 @@ export async function startBroker(options: { directory: string; port?: number; e
             if (terminalStates.has(message.state) || Date.now() >= deadline) {
               json(response, 200, { request: message, timed_out: !terminalStates.has(message.state) }); return;
             }
-            await delay(150, undefined, { signal: abort.signal });
+            await sleepOrWake(`request:${id}`, Math.min(RECHECK_MS, Math.max(0, deadline - Date.now())), abort.signal);
           }
           return;
         }
@@ -151,6 +190,7 @@ export async function startBroker(options: { directory: string; port?: number; e
     clearInterval(sweep);
     clearInterval(prune);
     for (const waiter of waiters) waiter.abort();
+    wakeups.removeAllListeners();
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     store.close();

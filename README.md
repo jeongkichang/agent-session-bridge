@@ -124,6 +124,6 @@ pnpm test
 pnpm check
 ```
 
-자동 검증에는 저장·동시 재시도·접속 단절·재시작·권한·HTTP·실제 stdio MCP 양방향 전달·브로커 중복 시작이 포함됩니다. [검증 기록](docs/verification.md)은 자동 테스트와 실제 Claude 모델 왕복을 구분합니다.
+자동 검증에는 저장·동시 재시도·접속 단절·재시작·권한·HTTP·실제 stdio MCP 양방향 전달·브로커 중복 시작·도착 즉시 깨우기·보관 기간 정리가 포함됩니다. [검증 기록](docs/verification.md)은 자동 테스트와 실제 Claude 모델 왕복을 구분합니다.
 
 공식 확장 계약: [Claude Channels](https://code.claude.com/docs/en/channels), [채널 구현](https://code.claude.com/docs/en/channels-reference), [Codex MCP](https://learn.chatgpt.com/docs/extend/mcp?surface=cli), [Codex App Server](https://learn.chatgpt.com/docs/app-server).
