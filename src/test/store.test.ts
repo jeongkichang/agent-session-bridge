@@ -20,6 +20,55 @@ function setup() {
 }
 function code(expected: string) { return (error: unknown) => error instanceof BridgeError && error.code === expected; }
 
+test('retention removes finished records without touching live work', () => {
+  const { store, sender, receiver, send, advance } = setup();
+
+  const finished = send('old one');
+  store.take(receiver.id);
+  store.reply(receiver.id, { request_id: finished.request_id, text: 'done', outcome: 'completed' });
+
+  advance(40 * 86_400_000);
+  const stale = store.register({ id: randomUUID(), name: 'stale', kind: 'codex', secret: randomBytes(32).toString('hex') });
+  store.disconnect(stale.id);
+  advance(40 * 86_400_000);
+  // 살아 있는 요청은 시간을 앞당긴 «뒤에» 만든다. 먼저 만들면 유효기간이 지나 만료된다(그 자체는 정상 동작).
+  // 시간이 지나면 세션 임대도 끝나므로 다시 등록한다.
+  store.register(sender);
+  store.register(receiver);
+  const open = send('still open');
+
+  assert.deepEqual(store.prune(0), { requests: 0, peers: 0 }, '0 이면 아무것도 지우지 않는다');
+
+  const removed = store.prune(30);
+  assert.equal(removed.requests, 1, '끝난 기록만 지운다');
+  assert.ok(removed.peers >= 1, '기록이 걸리지 않은 오래된 세션 행도 지운다');
+
+  assert.throws(() => store.request(finished.request_id, sender.id));
+  assert.equal(store.request(open.request_id, sender.id).state, 'queued', '진행 중인 요청은 남는다');
+  assert.ok(store.peers().some((peer) => peer.id === sender.id), '기록이 걸린 세션 행은 남는다');
+  assert.ok(!store.peers().some((peer) => peer.id === stale.id));
+  store.close();
+});
+
+test('retention keeps an old departed peer that a surviving record still points at', () => {
+  const { store, receiver, register, advance } = setup();
+  // 보낸 세션이 떠난 뒤 상대가 나중에 답하는 경우. 기록은 최근이고 세션 행만 오래됐다.
+  const departed = register('departed');
+  const request = store.send(departed.id, { request_id: randomUUID(), peer_id: receiver.id, text: '먼저 보내고 떠남', ttl_seconds: 86_400 });
+  // 요청 유효기간(하루) 안에서 움직인다. 넘기면 답하기 전에 만료된다.
+  advance(12 * 3600_000);
+  store.register(receiver);
+  store.take(receiver.id);
+  store.reply(receiver.id, { request_id: request.request_id, text: '늦게 답함', outcome: 'completed' });
+
+  // 6시간보다 오래된 것을 지운다 — 세션 행(12시간 전)은 오래됐고 기록(방금)은 최근이다.
+  const removed = store.prune(0.25);
+  assert.equal(removed.requests, 0, '최근에 끝난 기록은 남긴다');
+  assert.ok(store.peers().some((peer) => peer.id === departed.id), '기록이 가리키는 세션 행은 오래돼도 지우지 않는다');
+  assert.equal(store.request(request.request_id, departed.id).reply, '늦게 답함');
+  store.close();
+});
+
 test('durable acceptance, explicit read ACK and one matching reply', () => {
   const { store, sender, receiver, send } = setup();
   const request = send();

@@ -38,6 +38,10 @@ export async function startBroker(options: { directory: string; port?: number; e
   let closing = false;
   const waiters = new Set<AbortController>();
   const sweep = setInterval(() => store.sweep(), 1000).unref();
+  // 정리는 드물게 돈다. 1초짜리 sweep 에 얹으면 매초 DELETE 를 시도하게 된다.
+  const retentionDays = Number(process.env.AGENT_BRIDGE_RETENTION_DAYS ?? 30);
+  store.prune(retentionDays);
+  const prune = setInterval(() => store.prune(retentionDays), 6 * 60 * 60_000).unref();
   const instance = randomUUID();
   const server = createServer(async (request, response) => {
     const abort = new AbortController();
@@ -145,6 +149,7 @@ export async function startBroker(options: { directory: string; port?: number; e
     if (closing) return;
     closing = true;
     clearInterval(sweep);
+    clearInterval(prune);
     for (const waiter of waiters) waiter.abort();
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));

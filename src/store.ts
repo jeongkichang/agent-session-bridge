@@ -34,6 +34,25 @@ export class Store {
     try { const result = fn(); this.db.exec('COMMIT'); return result; }
     catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
+  /**
+   * 끝난 기록을 지운다. 지우지 않으면 파일이 무한히 자란다(실측: 6일에 요청 955건·5.7MB).
+   * 진행 중인 요청과, 아직 기록이 걸려 있는 세션 행은 건드리지 않는다. days<=0 이면 지우지 않는다.
+   */
+  prune(days: number): { requests: number; peers: number } {
+    if (days <= 0) return { requests: 0, peers: 0 };
+    const cutoff = this.now() - days * 86_400_000;
+    const requests = Number(
+      this.db
+        .prepare("DELETE FROM requests WHERE state IN ('completed','failed','delivery_unknown','expired') AND COALESCE(finished_at, created_at) < ?")
+        .run(cutoff).changes,
+    );
+    const peers = Number(
+      this.db
+        .prepare('DELETE FROM peers WHERE lease_until <= ? AND seen_at < ? AND id NOT IN (SELECT from_id FROM requests UNION SELECT to_id FROM requests)')
+        .run(this.now(), cutoff).changes,
+    );
+    return { requests, peers };
+  }
   sweep() {
     const now = this.now();
     this.db.prepare("UPDATE requests SET state='delivery_unknown', reason='recipient_disconnected', finished_at=? WHERE state IN ('delivered','acknowledged') AND to_id IN (SELECT id FROM peers WHERE lease_until<=?)").run(now, now);
