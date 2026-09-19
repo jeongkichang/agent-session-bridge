@@ -33,8 +33,6 @@ export async function startBroker(options: { directory: string; port?: number; e
   const token = ownerToken(options.directory);
   const dbPath = join(options.directory, 'bridge.sqlite');
   for (const path of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) privateFile(path);
-  const store = new Store(dbPath);
-  privateFile(dbPath);
   let closing = false;
   const waiters = new Set<AbortController>();
   /**
@@ -44,6 +42,10 @@ export async function startBroker(options: { directory: string; port?: number; e
   const wakeups = new EventEmitter();
   wakeups.setMaxListeners(0);
   const wake = (key: string) => wakeups.emit(key);
+  // 요청이 끝나는 자리는 여럿이다(회신·전달 실패·상대 연결 끊김·유효기간 경과·브로커 재시작).
+  // 저장소가 그 전부를 한 곳으로 모아 주므로 여기서 보낸 쪽 대기만 깨우면 빠뜨리는 자리가 없다.
+  const store = new Store(dbPath, Date.now, (senders) => { for (const sender of senders) wake(`outbox:${sender}`); });
+  privateFile(dbPath);
   // 신호를 놓쳤을 때만 도는 재확인 주기. 짧게 두면 대기 수 × 쌓인 행 수만큼 CPU 를 태운다.
   const RECHECK_MS = 2000;
   const HEARTBEAT_MS = 10_000;
@@ -118,6 +120,20 @@ export async function startBroker(options: { directory: string; port?: number; e
           const message = store.take(peer);
           if (message || Date.now() >= deadline) { json(response, 200, { message, timed_out: !message }); return; }
           await sleepOrWake(`peer:${peer}`, Math.min(RECHECK_MS, Math.max(0, deadline - Date.now())), abort.signal);
+        }
+        return;
+      }
+      if (method === 'POST' && path === '/v1/outbox/next') {
+        // 받은 요청을 꺼내는 `/v1/inbox/next` 의 거울상 — 이쪽은 «내가 보낸» 요청이 끝났다는 것만 꺼낸다.
+        const peer = peerOnly();
+        const { timeout_ms } = z.object({ timeout_ms: z.number().int().min(0).max(50_000).default(0) }).strict().parse(await body(request));
+        const deadline = Date.now() + timeout_ms;
+        let beat = 0;
+        while (!abort.signal.aborted && !closing) {
+          if (Date.now() - beat >= HEARTBEAT_MS) { store.heartbeat(peer); beat = Date.now(); }
+          const notice = store.takeReply(peer);
+          if (notice || Date.now() >= deadline) { json(response, 200, { notice, timed_out: !notice }); return; }
+          await sleepOrWake(`outbox:${peer}`, Math.min(RECHECK_MS, Math.max(0, deadline - Date.now())), abort.signal);
         }
         return;
       }

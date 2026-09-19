@@ -1,16 +1,22 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
-import { BridgeError, type BridgeRequest, type Peer, PEER_LEASE_MS, terminalStates } from './contracts.js';
+import { BridgeError, type BridgeRequest, type Peer, PEER_LEASE_MS, type ReplyNotice, terminalStates } from './contracts.js';
 import type { z } from 'zod';
 import type { registrationSchema, sendSchema, replySchema } from './contracts.js';
 
 type Row = Record<string, string | number | null>;
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 const iso = (value: unknown) => value == null ? null : new Date(Number(value)).toISOString();
+const TERMINAL_SQL = [...terminalStates].map((state) => `'${state}'`).join(',');
 
 export class Store {
   readonly db: DatabaseSync;
-  constructor(path: string, private now: () => number = Date.now) {
+  /**
+   * `onFinished` 는 요청이 끝난 자리마다 «보낸 쪽» id 를 준다. 대기 중인 알림 폴링을 깨우는 신호일 뿐이라
+   * 여분이 섞여도 안전하다 — 실제 중복은 `reply_notified_at` 이 막는다. 한 자리라도 빠뜨리면 그 경로만
+   * 재확인 주기만큼 느려지고 테스트는 초록이므로, 끝나는 자리를 전부 이 함수 하나로 모은다.
+   */
+  constructor(path: string, private now: () => number = Date.now, private onFinished: (senders: readonly string[]) => void = () => {}) {
     this.db = new DatabaseSync(path);
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=3000;
       CREATE TABLE IF NOT EXISTS peers (
@@ -21,11 +27,22 @@ export class Store {
         id TEXT PRIMARY KEY, from_id TEXT NOT NULL REFERENCES peers(id), to_id TEXT NOT NULL REFERENCES peers(id),
         text TEXT NOT NULL, fingerprint TEXT NOT NULL, state TEXT NOT NULL,
         created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
-        delivered_at INTEGER, acknowledged_at INTEGER, finished_at INTEGER, reply TEXT, reason TEXT
+        delivered_at INTEGER, acknowledged_at INTEGER, finished_at INTEGER, reply TEXT, reason TEXT,
+        reply_notified_at INTEGER
       );
-      CREATE INDEX IF NOT EXISTS requests_inbox ON requests(to_id, state, created_at);`);
+      CREATE INDEX IF NOT EXISTS requests_inbox ON requests(to_id, state, created_at);
+      CREATE INDEX IF NOT EXISTS requests_outbox ON requests(from_id, state, finished_at);`);
+    // 먼저 만들어진 저장 파일에는 이 컬럼이 없다. 새 컬럼을 더하고, 그 시점에 «이미 끝나 있던» 기록은
+    // 알림을 마친 것으로 둔다 — 그러지 않으면 올리는 순간 지난 회신이 한꺼번에 밀려 나간다.
+    const columns = this.db.prepare('PRAGMA table_info(requests)').all() as Row[];
+    if (!columns.some((column) => column.name === 'reply_notified_at')) {
+      this.db.exec('ALTER TABLE requests ADD COLUMN reply_notified_at INTEGER');
+      this.db.prepare(`UPDATE requests SET reply_notified_at=? WHERE reply_notified_at IS NULL AND state IN (${TERMINAL_SQL})`).run(this.now());
+    }
     // A process may have delivered before a crash. Do not automatically replay work.
-    this.db.prepare("UPDATE requests SET state='delivery_unknown', reason='broker_restarted', finished_at=? WHERE state IN ('delivered','acknowledged')").run(this.now());
+    const restartedAt = this.now();
+    this.db.prepare("UPDATE requests SET state='delivery_unknown', reason='broker_restarted', finished_at=? WHERE state IN ('delivered','acknowledged')").run(restartedAt);
+    this.announceFinished(restartedAt, 'broker_restarted');
     this.db.exec('UPDATE peers SET lease_until=0');
   }
   close() { this.db.close(); }
@@ -53,11 +70,19 @@ export class Store {
     );
     return { requests, peers };
   }
+  /** 방금 끝난 기록의 보낸 쪽을 신호한다. 바뀐 행이 없으면 아무 일도 하지 않는다. */
+  private announceFinished(at: number, reason: string) {
+    const rows = this.db.prepare('SELECT DISTINCT from_id FROM requests WHERE finished_at=? AND reason=?').all(at, reason) as Row[];
+    if (rows.length > 0) this.onFinished(rows.map((row) => String(row.from_id)));
+  }
   sweep() {
     const now = this.now();
-    this.db.prepare("UPDATE requests SET state='delivery_unknown', reason='recipient_disconnected', finished_at=? WHERE state IN ('delivered','acknowledged') AND to_id IN (SELECT id FROM peers WHERE lease_until<=?)").run(now, now);
-    this.db.prepare("UPDATE requests SET state='expired', reason='request_expired', finished_at=? WHERE state='queued' AND expires_at<=?").run(now, now);
-    this.db.prepare("UPDATE requests SET state='delivery_unknown', reason='reply_deadline_elapsed', finished_at=? WHERE state IN ('delivered','acknowledged') AND expires_at<=?").run(now, now);
+    const mark = (statement: string, reason: string, ...bindings: (string | number)[]) => {
+      if (Number(this.db.prepare(statement).run(...bindings).changes) > 0) this.announceFinished(now, reason);
+    };
+    mark("UPDATE requests SET state='delivery_unknown', reason='recipient_disconnected', finished_at=? WHERE state IN ('delivered','acknowledged') AND to_id IN (SELECT id FROM peers WHERE lease_until<=?)", 'recipient_disconnected', now, now);
+    mark("UPDATE requests SET state='expired', reason='request_expired', finished_at=? WHERE state='queued' AND expires_at<=?", 'request_expired', now, now);
+    mark("UPDATE requests SET state='delivery_unknown', reason='reply_deadline_elapsed', finished_at=? WHERE state IN ('delivered','acknowledged') AND expires_at<=?", 'reply_deadline_elapsed', now, now);
   }
   register(input: z.infer<typeof registrationSchema>): Peer {
     this.sweep();
@@ -135,6 +160,23 @@ export class Store {
       return this.request(String(row.id), id);
     });
   }
+  /**
+   * 보낸 쪽이 «아직 안 알린» 끝난 요청 하나를 꺼낸다 — `take` 의 거울상이다. 꺼내면서 표시를 남기므로
+   * 재연결·재시작·동시 폴링에서 같은 회신이 두 번 나가지 않는다.
+   */
+  takeReply(id: string): ReplyNotice | null {
+    this.sweep();
+    return this.transaction(() => {
+      const row = this.db
+        .prepare(`SELECT id FROM requests WHERE from_id=? AND state IN (${TERMINAL_SQL}) AND reply_notified_at IS NULL ORDER BY COALESCE(finished_at, created_at), id LIMIT 1`)
+        .get(id) as Row | undefined;
+      if (!row) return null;
+      const marked = Number(this.db.prepare('UPDATE requests SET reply_notified_at=? WHERE id=? AND reply_notified_at IS NULL').run(this.now(), String(row.id)).changes);
+      if (marked === 0) return null;
+      const { text: _text, reply, ...notice } = this.request(String(row.id), id);
+      return { ...notice, has_reply: reply !== null };
+    });
+  }
   acknowledge(id: string, actor: string): BridgeRequest {
     const request = this.request(id, actor);
     if (request.to.id !== actor) throw new BridgeError('not_recipient', 403);
@@ -150,12 +192,16 @@ export class Store {
     if (terminalStates.has(request.state) || request.state === 'queued') throw new BridgeError('invalid_state', 409);
     this.db.prepare('UPDATE requests SET state=?,reply=?,finished_at=?,acknowledged_at=COALESCE(acknowledged_at,?) WHERE id=?')
       .run(input.outcome, input.text, this.now(), this.now(), input.request_id);
+    this.onFinished([request.from.id]);
     return this.request(input.request_id, actor);
   }
   failDelivery(id: string, actor: string): BridgeRequest {
     const request = this.request(id, actor);
     if (request.to.id !== actor) throw new BridgeError('not_recipient', 403);
-    if (request.state === 'delivered') this.db.prepare("UPDATE requests SET state='delivery_unknown',reason='channel_write_failed',finished_at=? WHERE id=?").run(this.now(), id);
+    if (request.state === 'delivered') {
+      this.db.prepare("UPDATE requests SET state='delivery_unknown',reason='channel_write_failed',finished_at=? WHERE id=?").run(this.now(), id);
+      this.onFinished([request.from.id]);
+    }
     return this.request(id, actor);
   }
   recent(): BridgeRequest[] {

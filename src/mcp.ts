@@ -95,12 +95,33 @@ export async function runMcp(kind: 'claude' | 'codex') {
           try {
             await server.notification({ method: 'notifications/claude/channel', params: {
               content: message.text,
-              meta: { request_id: message.request_id, sender: message.from.name, sender_kind: message.from.kind, user_approval: 'false', expires_at: message.expires_at },
+              meta: { event: 'request', request_id: message.request_id, sender: message.from.name, sender_kind: message.from.kind, user_approval: 'false', expires_at: message.expires_at },
             } });
           } catch {
             await client.deliveryFailed(message.request_id).catch(() => undefined);
           }
         } catch {
+          if (!abort.signal.aborted) await delay(1000, undefined, { signal: abort.signal }).catch(() => undefined);
+        }
+      }
+    })();
+    void (async () => {
+      try { await connection; } catch { return; }
+      if (kind !== 'claude') return;
+      // 회신 알림 루프 — 위 요청 루프의 거울상이다. **본문을 싣지 않는다**: 회신은 32 KiB 까지라
+      // 그만큼 세션에 쌓이고, 무엇보다 「읽었다」의 주체가 흐려진다. 이 알림은 «꺼내 가라»는 신호이고
+      // 내용은 get_reply 가 읽는다. 알림은 요청이 아니므로 다시 알림을 낳지 않는다.
+      while (!abort.signal.aborted) {
+        try {
+          const { notice } = await client.receiveReply(20_000, abort.signal);
+          if (!notice) continue;
+          await server.notification({ method: 'notifications/claude/channel', params: {
+            content: `A request you sent has finished (${notice.state}). Read the result with get_reply using this request_id; this notification does not carry the reply text.`,
+            meta: { event: 'reply', request_id: notice.request_id, sender: notice.to.name, sender_kind: notice.to.kind, state: notice.state, has_reply: String(notice.has_reply), user_approval: 'false', finished_at: notice.finished_at || '' },
+          } });
+        } catch (error) {
+          // 브로커가 이 경로를 모르면(옛 버전) 밀어 줄 수 없다. 1초마다 두드리지 말고 조용히 멈춘다.
+          if (error instanceof BridgeError && error.code === 'not_found') return;
           if (!abort.signal.aborted) await delay(1000, undefined, { signal: abort.signal }).catch(() => undefined);
         }
       }

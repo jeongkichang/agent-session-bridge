@@ -8,7 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { BridgeClient } from './client.js';
 import { runBroker } from './broker.js';
 import { ownerToken, privateDirectory, privateFile, readEndpoint, stateDirectory } from './state.js';
-import { BridgeError, nameSchema, idSchema, type BridgeRequest } from './contracts.js';
+import { BridgeError, nameSchema, idSchema, type BridgeRequest, type Peer } from './contracts.js';
 import { VERSION } from './version.js';
 
 const directory = stateDirectory();
@@ -121,9 +121,22 @@ async function main() {
     return;
   }
   if (command === 'doctor') {
-    let broker: unknown;
-    try { broker = await ownerRequest('/health'); } catch { broker = { ok: false, reason: 'broker_not_running' }; }
-    output({ version: VERSION, node: process.version, state_directory: directory, broker, automatic_desktop_wakeup: 'not_configured', desktop_reply_path: 'MCP list_requests / get_reply / wait_reply / receive_message', endpoint_file_present: existsSync(join(directory, 'endpoint.json')) });
+    // 깨우기는 «연결된 Claude 채널» 이 있어야 돈다(그 연결 안에서 두 루프가 돈다). 고정 문자열 대신 실제로 센다.
+    let broker: unknown = { ok: false, reason: 'broker_not_running' };
+    let wakeup = 'broker_not_running';
+    let listeners = 0;
+    try {
+      broker = await ownerRequest('/health');
+      wakeup = 'peers_unreadable';
+      listeners = ((await ownerRequest('/v1/peers')) as { peers: Peer[] }).peers.filter((peer) => peer.kind === 'claude' && peer.online).length;
+      wakeup = listeners > 0 ? 'active' : 'no_claude_channel_connected';
+    } catch { /* 위에서 잰 값을 그대로 낸다 */ }
+    output({
+      version: VERSION, node: process.version, state_directory: directory, broker,
+      automatic_desktop_wakeup: wakeup, claude_channels_connected: listeners,
+      desktop_reply_path: 'pushed reply notice (get_reply for the text) / MCP list_requests / get_reply / wait_reply / receive_message',
+      endpoint_file_present: existsSync(join(directory, 'endpoint.json')),
+    });
     return;
   }
   process.stdout.write(`Agent Session Bridge\n\nstart | stop | status | doctor | peers | history\nget <request-id> | wait <request-id>\nsend <peer-id-or-name> --file <message.txt> [--id <uuid>]\ncodex-mcp [--name <peer-name>]\nclaude-channel [--name <peer-name>]\nclaude-config [--name <peer-name>]\nclaude --name <peer-name> -- [Claude arguments, e.g. --resume <id>]\n\nClaude's development-channel confirmation and session permissions still apply.\nOnly explicitly connected sessions appear in peers.\n`);

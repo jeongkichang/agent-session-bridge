@@ -60,6 +60,18 @@ test('real stdio MCP adapters: channel delivery, explicit reply, reverse request
     data(await codex.callTool({ name: 'reply', arguments: { request_id: reverseId, text: 'answer from Codex' } }));
     const reverse = data(await claude.callTool({ name: 'get_reply', arguments: { request_id: reverseId } }));
     assert.equal(reverse.reply, 'answer from Codex');
+    // 회신도 밀어 준다 — 다만 «신호» 만이다. 본문은 위 get_reply 가 읽는다.
+    for (let i = 0; i < 100 && !notifications.some((n) => n.meta.request_id === reverseId && n.meta.event === 'reply'); i++) await delay(25);
+    const replyNotice = notifications.find((n) => n.meta.request_id === reverseId && n.meta.event === 'reply');
+    assert.ok(replyNotice, '보낸 쪽이 회신 도착을 알림으로 받는다');
+    assert.equal(replyNotice!.meta.sender, 'codex-test');
+    assert.equal(replyNotice!.meta.state, 'completed');
+    assert.equal(replyNotice!.meta.user_approval, 'false');
+    assert.equal(replyNotice!.content.includes('answer from Codex'), false, '알림에 회신 본문이 실리지 않는다');
+    await delay(200);
+    assert.equal(notifications.filter((n) => n.meta.request_id === reverseId).length, 1, '같은 회신을 두 번 알리지 않는다');
+    // 알림은 요청이 아니다 — 알림을 받았다고 새 요청이 생기지 않는다(claude 가 보낸 것은 여전히 하나다).
+    assert.equal(data(await claude.callTool({ name: 'list_requests', arguments: { direction: 'sent' } })).requests.length, 1);
     const repeatedWait = data(await claude.callTool({ name: 'wait_reply', arguments: { request_id: reverseId, timeout_ms: 0 } }));
     assert.equal(repeatedWait.timed_out, false);
     assert.equal(repeatedWait.request.state, 'completed');
@@ -98,6 +110,8 @@ test('real stdio MCP adapters: channel delivery, explicit reply, reverse request
     for (let i = 0; i < 100 && !notifications.some((n) => n.meta.request_id === afterRestartId); i++) await delay(25);
     assert.ok(notifications.some((n) => n.meta.request_id === afterRestartId));
     assert.equal(notifications.filter((n) => n.meta.request_id === interruptedId).length, 1);
+    // 알림 표시는 저장 파일에 남는다 — 브로커를 다시 띄워도 끝난 요청이 다시 밀려 나오지 않는다.
+    assert.equal(notifications.filter((n) => n.meta.request_id === reverseId).length, 1);
     data(await claude.callTool({ name: 'reply', arguments: { request_id: afterRestartId, text: 'recovered' } }));
     assert.equal(data(await codex.callTool({ name: 'get_reply', arguments: { request_id: afterRestartId } })).reply, 'recovered');
   } finally {

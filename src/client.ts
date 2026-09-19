@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { BridgeError, type BridgeRequest, type Peer } from './contracts.js';
+import { BridgeError, type BridgeRequest, type Peer, type ReplyNotice } from './contracts.js';
 import { ownerToken, readEndpoint, stateDirectory } from './state.js';
 
 export class BridgeClient {
@@ -49,6 +49,8 @@ export class BridgeClient {
   get(id: string) { return this.request<BridgeRequest>(`/v1/requests/${encodeURIComponent(id)}`); }
   wait(id: string, timeout = 50_000, signal?: AbortSignal) { return this.request<{ request: BridgeRequest; timed_out: boolean }>(`/v1/requests/${encodeURIComponent(id)}/wait?timeout_ms=${timeout}`, { signal, timeout: timeout + 5000 }); }
   receive(timeout = 50_000, signal?: AbortSignal) { return this.request<{ message: BridgeRequest | null; timed_out: boolean }>('/v1/inbox/next', { method: 'POST', body: { timeout_ms: timeout }, signal, timeout: timeout + 5000 }); }
+  /** 내가 보낸 요청이 끝났다는 알림 하나를 기다린다. 본문은 안 온다 — 내용은 `get` 으로 읽는다. */
+  receiveReply(timeout = 50_000, signal?: AbortSignal) { return this.request<{ notice: ReplyNotice | null; timed_out: boolean }>('/v1/outbox/next', { method: 'POST', body: { timeout_ms: timeout }, signal, timeout: timeout + 5000 }); }
   acknowledge(id: string) { return this.request<BridgeRequest>(`/v1/requests/${encodeURIComponent(id)}/ack`, { method: 'POST' }); }
   reply(id: string, text: string, outcome: 'completed' | 'failed' = 'completed') { return this.request<BridgeRequest>(`/v1/requests/${encodeURIComponent(id)}/reply`, { method: 'POST', body: { text, outcome } }); }
   deliveryFailed(id: string) { return this.request<BridgeRequest>(`/v1/requests/${encodeURIComponent(id)}/delivery-failed`, { method: 'POST' }); }

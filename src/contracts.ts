@@ -49,6 +49,11 @@ export interface BridgeRequest {
   authority: 'external_ai_message';
   user_approval: false;
 }
+/**
+ * 끝난 요청을 «보낸 쪽» 에게 알릴 때 싣는 모양 — 본문(`text`)과 회신(`reply`)이 «없다».
+ * 알림은 「꺼내 가라」는 신호이고, 내용은 요청 조회로 읽는다.
+ */
+export type ReplyNotice = Omit<BridgeRequest, 'text' | 'reply'> & { has_reply: boolean };
 export class BridgeError extends Error {
   constructor(public code: string, public status = 400, message = code) {
     super(message);
